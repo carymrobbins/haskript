@@ -1,0 +1,4 @@
+#!/usr/bin/env haskript
+
+main :: IO ()
+main = putStrLn "Hello Haskript!"
