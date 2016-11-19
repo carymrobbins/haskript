@@ -1,8 +1,9 @@
 {-# LANGUAGE LambdaCase #-}
--- {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE RecordWildCards #-}
 module Main where
 
+import Data.Monoid
+import Data.Time
 import Control.Monad
 import System.Directory
 import System.Environment
@@ -11,7 +12,6 @@ import System.FilePath
 import System.IO
 import System.IO.Unsafe
 import System.Process
--- import Text.InterpolatedString.Perl6 (q)
 
 -- TODO: Make configurable via .haskriptrc
 stackExe :: String
@@ -19,85 +19,181 @@ stackExe = "stack"
 
 data Args = Args
   { scriptPath :: FilePath
-  }
+  , scriptArgs :: [String]
+  } deriving Show
 
-main :: IO ()
-main = do
-  Args{..} <- parseArgs
-  ensureHaskriptWorkDir
-  let (_, scriptRelPath) = splitDrive scriptPath
-      scriptTargetPath = haskriptWorkDir </> scriptRelPath
-  skipCompile <- contentsAreIdentical scriptPath scriptTargetPath
-  unless skipCompile $ doCompile scriptPath scriptTargetPath
-  runScript scriptTargetPath
+data Project = Project
+  { projectName :: String
+  , projectPath :: String
+  , projectModifiedTime :: UTCTime
+  , projectFiles :: [ProjectFile]
+  } deriving Show
 
--- TODO: Redirect handles (stdin, stdout, stderr) accordingly
-runScript :: FilePath -> IO ()
-runScript target = do
-  (code, out, err) <- readProcessWithExitCode stackExe ["--stack-yaml", target </> "stack.yaml", "exec", "--", takeFileName target] ""
-  putStrLn out
-  hPutStrLn stderr err
-  exitWith code
+data ProjectFile = ProjectFile
+    { projectFileName :: String
+    , projectFileContent :: String
+    } deriving Show
 
--- | This copies the file from 'src' to 'target'. Note that each file gets its
--- own project, so a 'src' of "/foo/bar.hs" will actually copy the script to
--- "~/.haskript-work/foo/bar.hs/bar.hs"
-doCompile :: FilePath -> FilePath -> IO ()
-doCompile src target = do
-  let targetName = takeFileName target
-  createDirectoryIfMissing True target
-  -- Duplicate the file name in the path, see the haddock comment above.
-  let fullTargetPath = target </> targetName
-  copyFile src fullTargetPath
-  -- TODO: Add args from -- stack comment.
-  -- contents <- readFile fullTargetPath
-  createSetupFile target
-  createCabalFile target
-  createStackFile target
-  (code, _, err) <- readProcessWithExitCode stackExe ["build", "--stack-yaml", target </> "stack.yaml"] ""
-  case code of
-    ExitSuccess -> return ()
-    ExitFailure _ -> hPutStrLn stderr err >> exitWith code
-
-createSetupFile :: FilePath -> IO ()
-createSetupFile target = writeFile (target </> "Setup.hs") $ unlines
-  [ "import Distribution.Simple"
-  , "main = defaultMain"
-  ]
-
--- TODO: Add args from -- stack comment.
-createCabalFile :: FilePath -> IO ()
-createCabalFile target = writeFile (target </> baseName ++ ".cabal") $ unlines
-  [ "name: " ++ baseName
-  , "version: 0"
-  , "cabal-version: >=1.10"
-  , "executable " ++ scriptName
-  , "  hs-source-dirs: ."
-  , "  main-is: " ++ scriptName
-  , "  build-depends: base"
-  ]
-  where
-  scriptName = takeFileName target
-  (baseName, _) = splitExtensions scriptName
-
--- TODO: Add args from -- stack comment.
-createStackFile :: FilePath -> IO ()
-createStackFile target = writeFile (target </> "stack.yaml") $ unlines
-  [ "resolver: lts-7.2"
-  , "packages:"
-  , "- '.'"
-  ]
+projectFileAbsPath :: Project -> ProjectFile -> String
+projectFileAbsPath Project{..} ProjectFile{..} = projectPath </> projectFileName
 
 usage :: String
 usage = "Usage: haskript path/to/script"
--- usage = [q|
---
--- |]
+
+main :: IO ()
+main = do
+  args@Args{..} <- parseArgs
+  project <- createProjectData args
+  shouldWrite <- requiresWriteProject project
+  when shouldWrite $ do
+    writeProject project
+    buildProject project
+  exe <- findCompiledExe project
+  putStrLn $ "Found executable: " <> exe
+  -- TODO: rawSystem doesn't seem to work
+  exitWith =<< rawSystem exe scriptArgs
+
+errExit :: String -> IO a
+errExit msg = hPutStrLn stderr msg >> exitFailure
+
+whenM :: Monad m => m Bool -> m () -> m ()
+whenM predM onTrue = do
+  p <- predM
+  when p onTrue
+
+unlessM :: Monad m => m Bool -> m () -> m ()
+unlessM predM onFalse = do
+  p <- predM
+  unless p onFalse
+
+allM :: Monad m => (m a -> m Bool) -> [m a] -> m Bool
+allM _ [] = return True
+allM f (x:xs) = do
+  b <- f x
+  if b then allM f xs else return False
+
+anyM :: Monad m => (m a -> m Bool) -> [m a] -> m Bool
+anyM _ [] = return False
+anyM f (x:xs) = do
+  b <- f x
+  if b then return True else anyM f xs
 
 parseArgs :: IO Args
 parseArgs = getArgs >>= \case
-  [scriptPath] -> return Args {..}
-  _ -> hPutStrLn stderr usage >> exitFailure
+  ["--help"] -> putStrLn usage >> exitSuccess
+
+  scriptPath:scriptArgs -> do
+    unlessM (doesFileExist scriptPath) $ errExit $ "File does not exist: " <> scriptPath
+    return Args {..}
+
+  _ -> errExit usage
+
+findCompiledExe :: Project -> IO String
+findCompiledExe Project{..} = do
+  -- TODO: Handle Windows
+  (exitCode, out, err) <- readProcessWithExitCode stackExe
+      [ "--stack-yaml", projectPath </> "stack.yaml",
+        "exec", "--",
+        "command", "-v", projectName
+      ] ""
+  case exitCode of
+    ExitSuccess -> return out
+    ExitFailure _ -> do
+      hPutStrLn stderr $ "Could not locate compiled executable for " <> projectName
+      hPutStrLn stderr err
+      exitWith exitCode
+
+buildProject :: Project -> IO ()
+buildProject Project{..} = do
+  (exitCode, _, err) <- readProcessWithExitCode stackExe
+      ["--stack-yaml", projectPath </> "stack.yaml", "build"] ""
+  case exitCode of
+    ExitSuccess -> return ()
+    ExitFailure _ -> do
+      hPutStrLn stderr err
+      exitWith exitCode
+
+requiresWriteProject :: Project -> IO Bool
+requiresWriteProject Project{..} = anyM id actions
+  where
+  actions =
+    [ not <$> doesFileExist projectPath
+    , anyM id $ map requiresWriteProjectFile projectFiles
+    ]
+  requiresWriteProjectFile :: ProjectFile -> IO Bool
+  requiresWriteProjectFile ProjectFile{..} = do
+    let absPath = projectPath </> projectFileName
+    exists <- doesFileExist absPath
+    modTime <- getModificationTime absPath
+    return $ not exists || projectModifiedTime > modTime
+
+writeProject :: Project -> IO ()
+writeProject Project{..} = do
+  createDirectoryIfMissing True projectPath
+  forM_ projectFiles $ \ProjectFile{..} ->
+    writeFile (projectPath </> projectFileName) projectFileContent
+
+createProjectData :: Args -> IO Project
+createProjectData args@Args{..} = do
+  p <- emptyProject
+  let cabalFile = buildCabalFile p
+  mainFile <- buildMainFile args
+  return $ p { projectFiles = [cabalFile, mainFile, setupFile, stackFile] }
+  where
+  emptyProject = do
+    let projectFiles = []
+    let projectName = takeBaseName scriptPath
+    fullScriptPath <- makeAbsolute scriptPath
+    let projectPath = haskriptWorkDir </> (snd . splitDrive $ fullScriptPath)
+    projectModifiedTime <- getModificationTime scriptPath
+    return Project{..}
+
+mainFileName :: String
+mainFileName = "Main.hs"
+
+buildMainFile :: Args -> IO ProjectFile
+buildMainFile Args{..} = do
+  let projectFileName = mainFileName
+  projectFileContent <- readFile scriptPath
+  return ProjectFile{..}
+
+buildCabalFile :: Project -> ProjectFile
+buildCabalFile Project{..} = ProjectFile{..}
+  where
+  projectFileName = projectName <> ".cabal"
+  projectFileContent = unlines
+    [ "name: " <> projectName
+    , "version: 0"
+    , "cabal-version: >=1.10"
+    , "build-type: Simple"
+    , ""
+    , "executable " <> projectName
+    , "  hs-source-dirs: ."
+    , "  main-is: " <> mainFileName
+    -- TODO: Add args from -- stack comment.
+    , "  build-depends: base"
+    , "  default-language: Haskell2010"
+    ]
+
+setupFile :: ProjectFile
+setupFile = ProjectFile{..}
+  where
+  projectFileName = "Setup.hs"
+  projectFileContent = unlines
+    [ "import Distribution.Simple"
+    , "main = defaultMain"
+    ]
+
+
+stackFile :: ProjectFile
+stackFile = ProjectFile{..}
+  where
+  projectFileName = "stack.yaml"
+  projectFileContent = unlines
+    [ "resolver: lts-7.2"
+    , "packages:"
+    , "  - '.'"
+    ]
 
 homeDir :: FilePath
 {-# NOINLINE homeDir #-}
