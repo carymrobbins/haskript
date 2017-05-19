@@ -34,24 +34,43 @@ data ProjectFile = ProjectFile
     , projectFileContent :: String
     } deriving Show
 
-projectFileAbsPath :: Project -> ProjectFile -> String
-projectFileAbsPath Project{..} ProjectFile{..} = projectPath </> projectFileName
-
 usage :: String
-usage = "Usage: haskript path/to/script"
+usage = unlines
+  [ "Usage: haskript [haskript options] path/to/script [script args]"
+  , ""
+  , "Haskript Options"
+  , "  -v|--verbose       Verbose logging output from Haskript"
+  ]
+
+logger :: String -> IO ()
+logger = hPutStrLn stderr
 
 main :: IO ()
 main = do
   args@Args{..} <- parseArgs
+  logger $ show args
   project <- createProjectData args
+  logger $ take 100 $ show project
+  let targetExe = getTargetExe project
+  logger $ "targetExe: " <> targetExe
   shouldWrite <- requiresWriteProject project
+  -- TODO: shouldWrite is not computing correctly..
+  logger $ "shouldWrite: " <> show shouldWrite
   when shouldWrite $ do
     writeProject project
     buildProject project
-  exe <- findCompiledExe project
-  putStrLn $ "Found executable: " <> exe
-  -- TODO: rawSystem doesn't seem to work
-  exitWith =<< rawSystem exe scriptArgs
+    createDirectoryIfMissing True $ takeDirectory targetExe
+    exe <- findCompiledExe project
+    copyFile exe targetExe
+  -- TODO: Pass stdin, stdout, stderr accordingly
+  logger $ unwords ["readProcessWithExitCode", targetExe, show scriptArgs]
+  (code, out, err) <- readProcessWithExitCode targetExe scriptArgs ""
+  putStr out
+  hPutStr stderr err
+  exitWith code
+
+getTargetExe :: Project -> FilePath
+getTargetExe Project{..} = projectPath </> "bin" </> projectName
 
 errExit :: String -> IO a
 errExit msg = hPutStrLn stderr msg >> exitFailure
@@ -97,7 +116,7 @@ findCompiledExe Project{..} = do
         "command", "-v", projectName
       ] ""
   case exitCode of
-    ExitSuccess -> return out
+    ExitSuccess -> return $ reverse $ dropWhile (== '\n') $ reverse out
     ExitFailure _ -> do
       hPutStrLn stderr $ "Could not locate compiled executable for " <> projectName
       hPutStrLn stderr err
@@ -201,14 +220,3 @@ homeDir = unsafePerformIO getHomeDirectory
 
 haskriptWorkDir :: FilePath
 haskriptWorkDir = homeDir </> ".haskript-work"
-
-ensureHaskriptWorkDir :: IO ()
-ensureHaskriptWorkDir = createDirectoryIfMissing True haskriptWorkDir
-
-contentsAreIdentical :: FilePath -> FilePath -> IO Bool
-contentsAreIdentical f1 f2 = do
-  (e1, e2) <- (,) <$> doesFileExist f1 <*> doesFileExist f2
-  if not $ e1 && e2 then return False else do
-    c1 <- readFile f1
-    c2 <- readFile f2
-    return $ c1 == c2
